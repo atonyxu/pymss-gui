@@ -14,6 +14,80 @@ from pymss.model_registry import model_root, model_path_for, auxiliary_paths_for
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pymss_gui_config.json")
 
+VALID_MODEL_TYPES = [
+    "bs_roformer", "mel_band_roformer", "htdemucs", "mdx23c",
+    "bandit", "bandit_v2", "scnet", "apollo", "vr",
+]
+
+
+class CustomModel:
+    """A locally discovered custom model defined by a weight file plus yaml config."""
+
+    def __init__(self, name, model_path, config_path, model_type):
+        self.name = name
+        self.model_path = model_path
+        self.config_path = config_path
+        self.model_type = model_type
+        self.relpath = os.path.basename(model_path)
+        self.is_custom = True
+
+    def __repr__(self):
+        return f"CustomModel({self.name})"
+
+
+def load_yaml(path):
+    """Load a yaml file, tolerating MSST-style !!python/tuple / !!python/list tags."""
+    import yaml
+
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    def _tuple(loader, node):
+        return tuple(loader.construct_sequence(node))
+
+    def _list(loader, node):
+        return list(loader.construct_sequence(node))
+
+    _Loader.add_constructor("tag:yaml.org,2002:python/tuple", _tuple)
+    _Loader.add_constructor("tag:yaml.org,2002:python/list", _list)
+
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.load(f, Loader=_Loader) or {}
+
+
+def scan_custom_models(model_dir):
+    """Scan model_dir recursively for *.ckpt weight files with a matching *.yaml config.
+
+    The yaml config must contain a `model_type` key. Returns a list of CustomModel.
+    """
+    if not model_dir or not os.path.isdir(model_dir):
+        return []
+    found = []
+    for root, _dirs, files in os.walk(model_dir):
+        for fname in files:
+            if not fname.lower().endswith(".ckpt"):
+                continue
+            base = fname[: -len(".ckpt")]
+            yaml_path = None
+            for ext in (".yaml", ".yml"):
+                cand = os.path.join(root, base + ext)
+                if os.path.isfile(cand):
+                    yaml_path = cand
+                    break
+            if not yaml_path:
+                continue
+            try:
+                cfg = load_yaml(yaml_path)
+                model_type = cfg.get("model_type")
+            except Exception:
+                model_type = None
+            if not model_type or model_type not in VALID_MODEL_TYPES:
+                continue
+            name = f"[自定义] {base}"
+            found.append(CustomModel(name, os.path.join(root, fname), yaml_path, model_type))
+    found.sort(key=lambda m: m.name.lower())
+    return found
+
 
 def load_config():
     try:
@@ -188,21 +262,38 @@ class App(tk.Tk):
         if d:
             self.modeldir_var.set(d)
 
+    def _scan_custom(self):
+        model_dir = self.modeldir_var.get().strip() or None
+        try:
+            return scan_custom_models(model_dir)
+        except Exception as e:
+            self._log(f"[错误] 扫描自定义模型失败: {e}\n")
+            return []
+
     def _refresh_models(self):
         try:
-            self.model_entries = list_models(supported=True)
+            catalog = list_models(supported=True)
         except Exception as e:
             self._log(f"[错误] 获取模型列表失败: {e}\n")
             return
-        downloaded = [m for m in self.model_entries if self._is_downloaded(m)]
-        pending = [m for m in self.model_entries if m not in downloaded]
-        self.model_entries = downloaded + pending
-        names = [("* " + m.name) if m in downloaded else m.name for m in self.model_entries]
+        custom = self._scan_custom()
+        self.custom_entries = custom
+        self.model_entries = custom + catalog
+        downloaded = [m for m in catalog if self._is_downloaded(m)]
+        pending = [m for m in catalog if m not in downloaded]
+        ordered = custom + downloaded + pending
+        names = [("* " + m.name) if m in downloaded else m.name for m in ordered]
         self.model_combo["values"] = names
         saved = self.cfg.get("model_name", "")
-        saved_disp = ("* " + saved) if saved else ""
-        if saved_disp in names:
-            self.model_var.set(saved_disp)
+        if saved:
+            saved_disp = ("* " + saved) if any(
+                m.name == saved for m in downloaded) else saved
+            if saved_disp in names:
+                self.model_var.set(saved_disp)
+            elif saved in names:
+                self.model_var.set(saved)
+            elif names:
+                self.model_var.set(names[0])
         elif downloaded:
             self.model_var.set("* " + downloaded[0].name)
         elif names:
@@ -216,6 +307,18 @@ class App(tk.Tk):
             if m.name == name:
                 return m
         return None
+
+    def _custom_inference_params(self, config_path):
+        cfg = load_yaml(config_path)
+        params = {"normalize": self.normalize_var.get()}
+        inf = cfg.get("inference") or {}
+        for k, v in inf.items():
+            if k == "num_overlap":
+                if "overlap_size" not in inf:
+                    params["overlap_size"] = v
+            else:
+                params[k] = v
+        return params
 
     def _is_downloaded(self, entry):
         model_dir = self.modeldir_var.get().strip() or None
@@ -285,16 +388,24 @@ class App(tk.Tk):
         self._save_cfg()
 
         args = dict(
-            model_name=entry.name,
             model_dir=self.modeldir_var.get().strip() or None,
             device=self.device_var.get(),
             output_format=self.format_var.get(),
             use_tta=self.tta_var.get(),
             save_as_folder=self.asfolder_var.get(),
-            download=False,
             store_dirs=output,
             inference_params={"normalize": self.normalize_var.get()},
         )
+        if getattr(entry, "is_custom", False):
+            args.update(
+                model_type=entry.model_type,
+                model_path=entry.model_path,
+                config_path=entry.config_path,
+            )
+            try:
+                args["inference_params"] = self._custom_inference_params(entry.config_path)
+            except Exception as e:
+                self._log(f"[警告] 读取自定义推理参数失败: {e}\n")
 
         self.stop_event.clear()
         self.run_btn.config(state="disabled")
@@ -303,7 +414,11 @@ class App(tk.Tk):
 
         def worker():
             try:
-                sep = MSSeparator.from_model_name(**args)
+                if getattr(entry, "is_custom", False):
+                    custom_args = {k: v for k, v in args.items() if k != "model_dir"}
+                    sep = MSSeparator(**custom_args)
+                else:
+                    sep = MSSeparator.from_model_name(model_name=entry.name, **args)
                 for path in inputs:
                     if self.stop_event.is_set():
                         self._log("[停止] 用户取消推理。\n")
@@ -437,6 +552,9 @@ class App(tk.Tk):
         if not entry:
             messagebox.showwarning("提示", "请先选择一个模型")
             return
+        if getattr(entry, "is_custom", False):
+            messagebox.showinfo("提示", "自定义模型已位于本地，无需下载")
+            return
         model_dir = self.modeldir_var.get().strip() or None
         self.cat_download_btn.config(state="disabled")
         self._log(f"开始下载模型: {entry.name} ...\n")
@@ -455,13 +573,15 @@ class App(tk.Tk):
 
     def _refresh_catalog(self):
         try:
-            self.catalog_entries = list_models(supported=self.only_supported_var.get())
+            catalog = list_models(supported=self.only_supported_var.get())
         except Exception as e:
             self._log(f"[错误] 获取模型列表失败: {e}\n")
             return
-        downloaded = [m for m in self.catalog_entries if self._is_downloaded(m)]
-        pending = [m for m in self.catalog_entries if m not in downloaded]
-        self.catalog_entries = downloaded + pending
+        custom = self._scan_custom()
+        self.custom_entries = custom
+        downloaded = [m for m in catalog if self._is_downloaded(m)]
+        pending = [m for m in catalog if m not in downloaded]
+        self.catalog_entries = custom + downloaded + pending
         names = [("* " + m.name) if m in downloaded else m.name for m in self.catalog_entries]
         self.cat_model_combo["values"] = names
         if names:
@@ -477,22 +597,31 @@ class App(tk.Tk):
         entry = next((m for m in self.catalog_entries if m.name == name), None)
         if not entry:
             return
-        downloaded = self._is_downloaded(entry)
-        lines = [f"名称: {entry.name}",
-                 f"别名: {', '.join(entry.aliases)}",
-                 f"类别: {entry.category_path}",
-                 f"架构: {entry.architecture}",
-                 f"模型类型: {entry.model_type}",
-                 f"目标音轨: {entry.target_stem}",
-                 f"支持: {entry.supported}",
-                 f"已下载: {'是' if downloaded else '否'}",
-                 f"大小: {entry.size_bytes} bytes",
-                 f"配置: {entry.config_relpath}",
-                 f"权重: {entry.relpath}"]
+        lines = self._model_info_lines(entry)
         self.cat_info_text.config(state="normal")
         self.cat_info_text.delete("1.0", "end")
         self.cat_info_text.insert("1.0", "\n".join(lines))
         self.cat_info_text.config(state="disabled")
+
+    def _model_info_lines(self, entry):
+        if getattr(entry, "is_custom", False):
+            return [f"名称: {entry.name}",
+                    f"类型: 自定义模型",
+                    f"model_type: {entry.model_type}",
+                    f"权重: {entry.model_path}",
+                    f"配置: {entry.config_path}"]
+        downloaded = self._is_downloaded(entry)
+        return [f"名称: {entry.name}",
+                f"别名: {', '.join(entry.aliases)}",
+                f"类别: {entry.category_path}",
+                f"架构: {entry.architecture}",
+                f"模型类型: {entry.model_type}",
+                f"目标音轨: {entry.target_stem}",
+                f"支持: {entry.supported}",
+                f"已下载: {'是' if downloaded else '否'}",
+                f"大小: {entry.size_bytes} bytes",
+                f"配置: {entry.config_relpath}",
+                f"权重: {entry.relpath}"]
 
     # ------------------------------------------------------------------ #
     # Log & misc
