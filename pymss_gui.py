@@ -55,13 +55,16 @@ def load_yaml(path):
         return yaml.load(f, Loader=_Loader) or {}
 
 
-def scan_custom_models(model_dir):
+def scan_custom_models(model_dir, exclude_paths=None):
     """Scan model_dir recursively for *.ckpt weight files with a matching *.yaml config.
 
     The yaml config must contain a `model_type` key. Returns a list of CustomModel.
+    `exclude_paths` is a set of absolute weight paths belonging to official catalog
+    models, which are skipped so they are not duplicated as custom models.
     """
     if not model_dir or not os.path.isdir(model_dir):
         return []
+    exclude_paths = {os.path.abspath(p) for p in (exclude_paths or [])}
     found = []
     for root, _dirs, files in os.walk(model_dir):
         for fname in files:
@@ -81,7 +84,12 @@ def scan_custom_models(model_dir):
                 model_type = cfg.get("model_type")
             except Exception:
                 model_type = None
-            if not model_type or model_type not in VALID_MODEL_TYPES:
+            if not model_type:
+                model_type = "bs_roformer"
+            if model_type not in VALID_MODEL_TYPES:
+                continue
+            weight_path = os.path.abspath(os.path.join(root, fname))
+            if weight_path in exclude_paths:
                 continue
             name = f"[自定义] {base}"
             found.append(CustomModel(name, os.path.join(root, fname), yaml_path, model_type))
@@ -262,10 +270,16 @@ class App(tk.Tk):
         if d:
             self.modeldir_var.set(d)
 
-    def _scan_custom(self):
+    def _scan_custom(self, catalog=None):
         model_dir = self.modeldir_var.get().strip() or None
+        exclude = set()
+        for m in (catalog or []):
+            try:
+                exclude.add(str(model_path_for(m, model_dir)))
+            except Exception:
+                pass
         try:
-            return scan_custom_models(model_dir)
+            return scan_custom_models(model_dir, exclude_paths=exclude)
         except Exception as e:
             self._log(f"[错误] 扫描自定义模型失败: {e}\n")
             return []
@@ -276,17 +290,17 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"[错误] 获取模型列表失败: {e}\n")
             return
-        custom = self._scan_custom()
+        custom = self._scan_custom(catalog)
         self.custom_entries = custom
         self.model_entries = custom + catalog
         downloaded = [m for m in catalog if self._is_downloaded(m)]
         pending = [m for m in catalog if m not in downloaded]
         ordered = custom + downloaded + pending
-        names = [("* " + m.name) if m in downloaded else m.name for m in ordered]
+        names = [("[已下载] " + m.name) if m in downloaded else m.name for m in ordered]
         self.model_combo["values"] = names
         saved = self.cfg.get("model_name", "")
         if saved:
-            saved_disp = ("* " + saved) if any(
+            saved_disp = ("[已下载] " + saved) if any(
                 m.name == saved for m in downloaded) else saved
             if saved_disp in names:
                 self.model_var.set(saved_disp)
@@ -295,14 +309,14 @@ class App(tk.Tk):
             elif names:
                 self.model_var.set(names[0])
         elif downloaded:
-            self.model_var.set("* " + downloaded[0].name)
+            self.model_var.set("[已下载] " + downloaded[0].name)
         elif names:
             self.model_var.set(names[0])
         self.model_combo.bind("<<ComboboxSelected>>", lambda e: None)
         self._log(f"已加载 {len(names)} 个可用模型（已下载 {len(downloaded)} 个）。\n")
 
     def _selected_entry(self):
-        name = self.model_var.get().lstrip("* ").strip()
+        name = self.model_var.get().replace("[已下载] ", "", 1).strip()
         for m in self.model_entries:
             if m.name == name:
                 return m
@@ -357,7 +371,7 @@ class App(tk.Tk):
         self.cfg.update({
             "input_files": self.input_var.get(),
             "output_folder": self.output_var.get(),
-            "model_name": self.model_var.get().lstrip("* ").strip(),
+            "model_name": self.model_var.get().replace("[已下载] ", "", 1).strip(),
             "pyenv": self.pyenv_var.get(),
             "model_dir": self.modeldir_var.get(),
             "device": self.device_var.get(),
@@ -547,7 +561,7 @@ class App(tk.Tk):
         self._refresh_catalog()
 
     def _download_catalog_model(self):
-        name = self.cat_model_var.get().lstrip("* ").strip()
+        name = self.cat_model_var.get().replace("[已下载] ", "", 1).strip()
         entry = next((m for m in self.catalog_entries if m.name == name), None)
         if not entry:
             messagebox.showwarning("提示", "请先选择一个模型")
@@ -577,12 +591,12 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"[错误] 获取模型列表失败: {e}\n")
             return
-        custom = self._scan_custom()
+        custom = self._scan_custom(catalog)
         self.custom_entries = custom
         downloaded = [m for m in catalog if self._is_downloaded(m)]
         pending = [m for m in catalog if m not in downloaded]
         self.catalog_entries = custom + downloaded + pending
-        names = [("* " + m.name) if m in downloaded else m.name for m in self.catalog_entries]
+        names = [("[已下载] " + m.name) if m in downloaded else m.name for m in self.catalog_entries]
         self.cat_model_combo["values"] = names
         if names:
             if self.cat_model_var.get() not in names:
@@ -593,7 +607,7 @@ class App(tk.Tk):
             self._show_catalog_info()
 
     def _show_catalog_info(self):
-        name = self.cat_model_var.get().lstrip("* ").strip()
+        name = self.cat_model_var.get().replace("[已下载] ", "", 1).strip()
         entry = next((m for m in self.catalog_entries if m.name == name), None)
         if not entry:
             return
