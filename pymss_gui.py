@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from pymss import list_models, MSSeparator, download_model, get_model_entry
+from pymss.model_registry import model_root, model_path_for, auxiliary_paths_for
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pymss_gui_config.json")
 
@@ -67,11 +68,14 @@ class App(tk.Tk):
 
         self.tab_main = ttk.Frame(self.notebook)
         self.tab_extra = ttk.Frame(self.notebook)
+        self.tab_models = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_main, text="推理 (Inference)")
         self.notebook.add(self.tab_extra, text="其他功能 (Tools)")
+        self.notebook.add(self.tab_models, text="模型信息 (Models)")
 
         self._build_main_tab()
         self._build_extra_tab()
+        self._build_models_tab()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -112,8 +116,14 @@ class App(tk.Tk):
 
         # model location
         ttk.Label(f, text="模型位置:").grid(row=4, column=0, sticky="w", **pad)
-        self.modeldir_var = tk.StringVar(value=self.cfg.get("model_dir", ""))
-        ttk.Entry(f, textvariable=self.modeldir_var).grid(row=4, column=1, sticky="ew", **pad)
+        try:
+            default_model_dir = str(model_root())
+        except Exception:
+            default_model_dir = ""
+        self.modeldir_var = tk.StringVar(value=self.cfg.get("model_dir") or default_model_dir)
+        modeldir_entry = ttk.Entry(f, textvariable=self.modeldir_var)
+        modeldir_entry.grid(row=4, column=1, sticky="ew", **pad)
+        modeldir_entry.bind("<FocusOut>", lambda e: self._refresh_download_states())
         ttk.Button(f, text="选择...", command=self._choose_modeldir).grid(row=4, column=2, **pad)
 
         # Options
@@ -184,21 +194,42 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"[错误] 获取模型列表失败: {e}\n")
             return
-        names = [m.name for m in self.model_entries]
+        downloaded = [m for m in self.model_entries if self._is_downloaded(m)]
+        pending = [m for m in self.model_entries if m not in downloaded]
+        self.model_entries = downloaded + pending
+        names = [("* " + m.name) if m in downloaded else m.name for m in self.model_entries]
         self.model_combo["values"] = names
         saved = self.cfg.get("model_name", "")
-        if saved in names:
-            self.model_var.set(saved)
+        saved_disp = ("* " + saved) if saved else ""
+        if saved_disp in names:
+            self.model_var.set(saved_disp)
+        elif downloaded:
+            self.model_var.set("* " + downloaded[0].name)
         elif names:
             self.model_var.set(names[0])
-        self._log(f"已加载 {len(names)} 个可用模型。\n")
+        self.model_combo.bind("<<ComboboxSelected>>", lambda e: None)
+        self._log(f"已加载 {len(names)} 个可用模型（已下载 {len(downloaded)} 个）。\n")
 
     def _selected_entry(self):
-        name = self.model_var.get()
+        name = self.model_var.get().lstrip("* ").strip()
         for m in self.model_entries:
             if m.name == name:
                 return m
         return None
+
+    def _is_downloaded(self, entry):
+        model_dir = self.modeldir_var.get().strip() or None
+        try:
+            paths = [model_path_for(entry, model_dir)] + auxiliary_paths_for(entry, model_dir)
+        except Exception:
+            return False
+        return all(os.path.exists(str(p)) for p in paths)
+
+    def _refresh_download_states(self):
+        if getattr(self, "model_entries", None):
+            self._refresh_models()
+        if getattr(self, "catalog_entries", None):
+            self._refresh_catalog()
 
     def _download_model(self):
         entry = self._selected_entry()
@@ -214,6 +245,8 @@ class App(tk.Tk):
                 self._log(f"模型下载完成: {entry.name}\n")
             except Exception as e:
                 self._log(f"[错误] 下载失败: {e}\n")
+            finally:
+                self.after(0, self._refresh_download_states)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -221,7 +254,7 @@ class App(tk.Tk):
         self.cfg.update({
             "input_files": self.input_var.get(),
             "output_folder": self.output_var.get(),
-            "model_name": self.model_var.get(),
+            "model_name": self.model_var.get().lstrip("* ").strip(),
             "pyenv": self.pyenv_var.get(),
             "model_dir": self.modeldir_var.get(),
             "device": self.device_var.get(),
@@ -316,14 +349,6 @@ class App(tk.Tk):
         ttk.Button(lf, text="选择输出...", command=self._choose_ens_output).pack(anchor="w", **pad)
         ttk.Button(lf, text="执行融合", command=self._run_ensemble).pack(anchor="w", **pad)
 
-        # Model info
-        lf2 = ttk.LabelFrame(f, text="模型信息")
-        lf2.pack(fill="x", padx=6, pady=6)
-        self.model_info_text = scrolledtext.ScrolledText(lf2, height=8, wrap="word")
-        self.model_info_text.pack(fill="both", expand=True, **pad)
-        self.model_info_text.config(state="disabled")
-        ttk.Button(lf2, text="显示当前模型信息", command=self._show_model_info).pack(anchor="w", **pad)
-
         # Info / help
         lf3 = ttk.LabelFrame(f, text="说明")
         lf3.pack(fill="both", expand=True, padx=6, pady=6)
@@ -333,7 +358,8 @@ class App(tk.Tk):
                 "· 『Python 环境』用于记录外部解释器路径（当前进程运行在 "
                 f"{sys.executable}）。\n"
                 "· 『下载所选模型』可预先拉取模型权重到模型位置。\n"
-                "· 其他功能: 音频融合、模型信息查看。\n")
+                "· 其他功能: 音频融合。\n"
+                "· 模型信息: 在『模型信息』选项卡查看全部模型详情与下载状态。\n")
         ttk.Label(lf3, text=info, justify="left", wraplength=740).pack(anchor="w", **pad)
 
     def _choose_ens_inputs(self):
@@ -373,11 +399,85 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_model_info(self):
-        entry = self._selected_entry()
+    # ------------------------------------------------------------------ #
+    # Tab 3: Model catalog
+    # ------------------------------------------------------------------ #
+    def _build_models_tab(self):
+        f = self.tab_models
+        pad = {"padx": 6, "pady": 4}
+
+        top = ttk.Frame(f)
+        top.pack(fill="x", **pad)
+        ttk.Label(top, text="选择模型:").pack(side="left", padx=4)
+        self.cat_model_var = tk.StringVar()
+        self.cat_model_combo = ttk.Combobox(top, textvariable=self.cat_model_var, state="readonly")
+        self.cat_model_combo.pack(side="left", fill="x", expand=True, padx=4)
+        self.cat_model_combo.bind("<<ComboboxSelected>>", lambda e: self._show_catalog_info())
+        ttk.Button(top, text="刷新列表", command=self._refresh_catalog).pack(side="left", padx=4)
+
+        self.only_supported_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="仅支持的模型", variable=self.only_supported_var,
+                        command=self._refresh_catalog).pack(side="left", padx=4)
+
+        self.cat_info_text = scrolledtext.ScrolledText(f, wrap="word")
+        self.cat_info_text.pack(fill="both", expand=True, **pad)
+        self.cat_info_text.config(state="disabled")
+
+        bf = ttk.Frame(f)
+        bf.pack(fill="x", **pad)
+        self.cat_download_btn = ttk.Button(bf, text="下载当前模型", command=self._download_catalog_model)
+        self.cat_download_btn.pack(side="left", padx=4)
+
+        self.catalog_entries = []
+        self._refresh_catalog()
+
+    def _download_catalog_model(self):
+        name = self.cat_model_var.get().lstrip("* ").strip()
+        entry = next((m for m in self.catalog_entries if m.name == name), None)
         if not entry:
-            messagebox.showwarning("提示", "请先在推理选项卡选择模型")
+            messagebox.showwarning("提示", "请先选择一个模型")
             return
+        model_dir = self.modeldir_var.get().strip() or None
+        self.cat_download_btn.config(state="disabled")
+        self._log(f"开始下载模型: {entry.name} ...\n")
+
+        def worker():
+            try:
+                download_model(entry.name, model_dir=model_dir, source="modelscope")
+                self._log(f"模型下载完成: {entry.name}\n")
+            except Exception as e:
+                self._log(f"[错误] 下载失败: {e}\n")
+            finally:
+                self.after(0, lambda: (self.cat_download_btn.config(state="normal"),
+                                       self._refresh_download_states()))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_catalog(self):
+        try:
+            self.catalog_entries = list_models(supported=self.only_supported_var.get())
+        except Exception as e:
+            self._log(f"[错误] 获取模型列表失败: {e}\n")
+            return
+        downloaded = [m for m in self.catalog_entries if self._is_downloaded(m)]
+        pending = [m for m in self.catalog_entries if m not in downloaded]
+        self.catalog_entries = downloaded + pending
+        names = [("* " + m.name) if m in downloaded else m.name for m in self.catalog_entries]
+        self.cat_model_combo["values"] = names
+        if names:
+            if self.cat_model_var.get() not in names:
+                self.cat_model_var.set(names[0])
+            self.cat_model_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda e: self._show_catalog_info())
+            self._show_catalog_info()
+
+    def _show_catalog_info(self):
+        name = self.cat_model_var.get().lstrip("* ").strip()
+        entry = next((m for m in self.catalog_entries if m.name == name), None)
+        if not entry:
+            return
+        downloaded = self._is_downloaded(entry)
         lines = [f"名称: {entry.name}",
                  f"别名: {', '.join(entry.aliases)}",
                  f"类别: {entry.category_path}",
@@ -385,13 +485,14 @@ class App(tk.Tk):
                  f"模型类型: {entry.model_type}",
                  f"目标音轨: {entry.target_stem}",
                  f"支持: {entry.supported}",
+                 f"已下载: {'是' if downloaded else '否'}",
                  f"大小: {entry.size_bytes} bytes",
                  f"配置: {entry.config_relpath}",
                  f"权重: {entry.relpath}"]
-        self.model_info_text.config(state="normal")
-        self.model_info_text.delete("1.0", "end")
-        self.model_info_text.insert("1.0", "\n".join(lines))
-        self.model_info_text.config(state="disabled")
+        self.cat_info_text.config(state="normal")
+        self.cat_info_text.delete("1.0", "end")
+        self.cat_info_text.insert("1.0", "\n".join(lines))
+        self.cat_info_text.config(state="disabled")
 
     # ------------------------------------------------------------------ #
     # Log & misc
